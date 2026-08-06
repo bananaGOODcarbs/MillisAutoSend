@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">毫秒定时发送</string>
+    <string name="accessibility_service_description">在用户设定的时间，对当前输入框执行发送，或点击当前页面中的“发送/Send/提交”按钮。应用不联网。</string>
+</resources>
