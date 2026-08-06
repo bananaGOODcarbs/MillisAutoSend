@@ -13,21 +13,43 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="毫秒定时发送"
-            android:textSize="26sp"
+            android:text="毫秒定时发送 · Shizuku版"
+            android:textSize="25sp"
             android:textStyle="bold" />
 
         <TextView
-            android:layout_width="wrap_content"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="提前准备好文字并保持输入框聚焦；到时自动发送一次。"
+            android:text="到点后通过 Shizuku 注入一次系统 Enter 键，不读取微信控件，也不使用坐标。"
             android:textSize="15sp" />
+
+        <TextView
+            android:id="@+id/shizukuStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="Shizuku：未连接"
+            android:textIsSelectable="true"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/openShizukuButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="1. 打开 / 安装 Shizuku" />
+
+        <Button
+            android:id="@+id/shizukuButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="2. 授权并连接 Shizuku" />
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="24dp"
+            android:layout_marginTop="22dp"
             android:text="目标时间（时:分:秒.毫秒）"
             android:textStyle="bold" />
 
@@ -44,7 +66,7 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="18dp"
+            android:layout_marginTop="16dp"
             android:text="提前发送（毫秒）"
             android:textStyle="bold" />
 
@@ -61,7 +83,7 @@
             android:id="@+id/currentTimeText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="22dp"
+            android:layout_marginTop="20dp"
             android:text="当前时间：--:--:--.---"
             android:textIsSelectable="true"
             android:textSize="18sp" />
@@ -71,29 +93,23 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="10dp"
-            android:minHeight="72dp"
+            android:minHeight="86dp"
             android:text="状态：未启动"
             android:textIsSelectable="true"
             android:textSize="16sp" />
 
         <Button
-            android:id="@+id/accessibilityButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="1. 开启无障碍服务" />
-
-        <Button
             android:id="@+id/testButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="2. 5 秒后测试发送" />
+            android:layout_marginTop="12dp"
+            android:text="3. 5秒后测试 Enter" />
 
         <Button
             android:id="@+id/startButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="3. 开始定时" />
+            android:text="4. 开始定时" />
 
         <Button
             android:id="@+id/stopButton"
@@ -111,7 +127,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="18dp"
-            android:text="正式使用时：保持屏幕点亮并解锁，打开目标聊天/表单页面，让输入框保持焦点；不要在最后几秒切换页面。"
+            android:text="使用前必须确认：\n1. Shizuku 正在运行且本应用已获授权；\n2. 微信已开启“回车键发送消息”，否则 Enter 可能只会换行；\n3. 提前输入文字，保持微信聊天输入框聚焦；\n4. 屏幕保持点亮并解锁；\n5. 每次手机重启后需要重新启动 Shizuku。"
             android:textSize="14sp" />
 
     </LinearLayout>

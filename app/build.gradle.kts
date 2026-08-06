@@ -11,12 +11,13 @@ android {
         applicationId = "com.example.millisautosend"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 20
+        versionName = "2.0-shizuku"
     }
 
     buildFeatures {
         viewBinding = true
+        aidl = true
     }
 
     compileOptions {
@@ -33,4 +34,8 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
+
+    val shizukuVersion = "13.1.5"
+    implementation("dev.rikka.shizuku:api:$shizukuVersion")
+    implementation("dev.rikka.shizuku:provider:$shizukuVersion")
 }
