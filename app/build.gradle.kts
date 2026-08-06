@@ -11,13 +11,14 @@ android {
         applicationId = "com.example.millisautosend"
         minSdk = 26
         targetSdk = 35
-        versionCode = 20
-        versionName = "2.0-shizuku"
+        versionCode = 21
+        versionName = "2.1-shizuku-build-fix"
     }
 
     buildFeatures {
         viewBinding = true
         aidl = true
+        buildConfig = true
     }
 
     compileOptions {
