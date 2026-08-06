@@ -1,17 +1,27 @@
 package com.example.millisautosend
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.graphics.Path
+import android.graphics.Rect
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.ArrayDeque
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -20,6 +30,7 @@ class AutoSendAccessibilityService : AccessibilityService() {
     private val taskSequence = AtomicLong(0L)
     @Volatile private var worker: Thread? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val logFormatter = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
         .withZone(ZoneId.systemDefault())
 
@@ -75,10 +86,15 @@ class AutoSendAccessibilityService : AccessibilityService() {
                 preciseWaitUntil(deadlineNs, taskId)
                 if (taskSequence.get() != taskId) return@Thread
 
-                val actualWallMs = System.currentTimeMillis()
-                val result = triggerSend()
+                // 无障碍节点查询和点击统一在主线程执行，避免部分系统返回空节点。
+                val result = triggerSendOnMainThread()
+                val actualWallMs = result.actionWallMs
                 val errorMs = actualWallMs - triggerWallMs
-                val resultText = if (result.success) "发送动作成功：${result.method}" else "发送失败：未找到可操作的输入框或发送按钮"
+                val resultText = if (result.success) {
+                    "发送动作成功：${result.method}"
+                } else {
+                    "发送失败：${result.method}"
+                }
                 setStatus(
                     "$resultText\n" +
                         "预定派发：${logFormatter.format(Instant.ofEpochMilli(triggerWallMs))}\n" +
@@ -126,90 +142,294 @@ class AutoSendAccessibilityService : AccessibilityService() {
                     LockSupport.parkNanos(min(5_000_000L, remainingNs - 5_000_000L))
                     if (Thread.interrupted()) throw InterruptedException()
                 }
-                else -> {
-                    // 最后约 20 ms 保持高频检查。Thread.yield() 可兼容较旧 Android。
-                    Thread.yield()
-                }
+                else -> Thread.yield()
             }
         }
+    }
+
+    private fun triggerSendOnMainThread(): SendResult {
+        if (Looper.myLooper() == Looper.getMainLooper()) return triggerSend()
+
+        val latch = CountDownLatch(1)
+        val resultRef = AtomicReference<SendResult>()
+        mainHandler.post {
+            try {
+                resultRef.set(triggerSend())
+            } catch (t: Throwable) {
+                resultRef.set(
+                    SendResult(
+                        success = false,
+                        method = "执行异常：${t.javaClass.simpleName}",
+                        actionWallMs = System.currentTimeMillis()
+                    )
+                )
+            } finally {
+                latch.countDown()
+            }
+        }
+
+        if (!latch.await(2, TimeUnit.SECONDS)) {
+            return SendResult(false, "主线程响应超时", System.currentTimeMillis())
+        }
+        return resultRef.get()
+            ?: SendResult(false, "未取得执行结果", System.currentTimeMillis())
     }
 
     private fun triggerSend(): SendResult {
-        val root = rootInActiveWindow ?: return SendResult(false, "无活动窗口")
+        val roots = collectCandidateRoots()
+        if (roots.isEmpty()) {
+            return SendResult(false, "没有可读取的应用窗口", System.currentTimeMillis())
+        }
 
-        // 优先对当前聚焦、可编辑的输入框执行输入法“发送/回车”。
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-            if (focused != null && focused.isEditable && focused.isEnabled) {
-                val supportsImeEnter = focused.actionList.any {
-                    it.id == AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id
+        // 微信窗口优先；之后才尝试其他前台应用窗口。
+        val orderedRoots = roots.sortedWith(
+            compareBy<RootEntry> {
+                when {
+                    it.packageName == WECHAT_PACKAGE -> 0
+                    it.windowType == AccessibilityWindowInfo.TYPE_APPLICATION -> 1
+                    else -> 2
                 }
-                if (supportsImeEnter && focused.performAction(
+            }.thenBy { it.windowId }
+        )
+
+        // 1. 先尝试对聚焦输入框执行输入法“发送/回车”。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            for (entry in orderedRoots) {
+                val focused = findFocusedEditable(entry.root) ?: continue
+                val actionTime = System.currentTimeMillis()
+                if (focused.performAction(
                         AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id
                     )
                 ) {
-                    return SendResult(true, "输入法发送")
+                    return SendResult(true, "输入法发送", actionTime)
                 }
             }
         }
 
-        // 输入法动作不可用时，自动查找“发送 / Send / 提交”按钮。
-        val candidate = findBestSendNode(root)
-        if (candidate != null) {
-            val clickable = findClickableSelfOrParent(candidate)
-            if (clickable != null && clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                return SendResult(true, "点击“${candidate.text ?: candidate.contentDescription ?: "发送"}”")
+        // 2. 扫描所有应用窗口，而不是只扫描 rootInActiveWindow。
+        //    键盘弹出时，rootInActiveWindow 有时会指向输入法窗口。
+        for (entry in orderedRoots) {
+            val candidate = findBestLabeledSendNode(entry.root) ?: continue
+            val result = clickNodeOrAncestor(candidate, "文字按钮")
+            if (result != null) return result
+        }
+
+        // 3. 微信专用兜底：不依赖按钮文字，根据输入框右侧的可点击控件自动识别绿色“发送”。
+        for (entry in orderedRoots.filter { it.packageName == WECHAT_PACKAGE }) {
+            val candidate = findWeChatRelativeSendNode(entry.root) ?: continue
+            val result = clickNodeOrAncestor(candidate, "微信发送按钮")
+            if (result != null) return result
+        }
+
+        return SendResult(false, buildFailureDetail(orderedRoots), System.currentTimeMillis())
+    }
+
+    private fun collectCandidateRoots(): List<RootEntry> {
+        val entries = mutableListOf<RootEntry>()
+        val seen = mutableSetOf<String>()
+
+        for (window in windows.orEmpty()) {
+            val root = window.root ?: continue
+            val packageName = root.packageName?.toString().orEmpty()
+            if (packageName == this.packageName) continue
+            val key = "${window.id}|$packageName|${window.type}"
+            if (seen.add(key)) {
+                entries += RootEntry(root, packageName, window.type, window.id)
             }
         }
 
-        return SendResult(false, "未找到")
+        rootInActiveWindow?.let { root ->
+            val packageName = root.packageName?.toString().orEmpty()
+            if (packageName != this.packageName) {
+                val key = "${root.windowId}|$packageName|active"
+                if (seen.add(key)) {
+                    entries += RootEntry(
+                        root = root,
+                        packageName = packageName,
+                        windowType = AccessibilityWindowInfo.TYPE_APPLICATION,
+                        windowId = root.windowId
+                    )
+                }
+            }
+        }
+        return entries
     }
 
-    private fun findBestSendNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(root)
+    private fun findFocusedEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.let {
+            if (it.isEditable && it.isEnabled && it.isVisibleToUser) return it
+        }
+
+        return collectNodes(root).firstOrNull {
+            it.isEditable && it.isEnabled && it.isVisibleToUser && it.isFocused
+        }
+    }
+
+    private fun findBestLabeledSendNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         var best: AccessibilityNodeInfo? = null
         var bestScore = Int.MIN_VALUE
 
-        while (queue.isNotEmpty()) {
-            val node = queue.removeFirst()
-            if (node.isVisibleToUser && node.isEnabled) {
-                val text = node.text?.toString()?.trim().orEmpty()
-                val description = node.contentDescription?.toString()?.trim().orEmpty()
-                val score = maxOf(scoreLabel(text), scoreLabel(description)) +
-                    if (node.isClickable) 20 else 0
-                if (score > bestScore) {
-                    bestScore = score
-                    best = node
-                }
-            }
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let(queue::addLast)
+        for (node in collectNodes(root)) {
+            if (!node.isVisibleToUser || !node.isEnabled) continue
+            val text = node.text?.toString()?.trim().orEmpty()
+            val description = node.contentDescription?.toString()?.trim().orEmpty()
+            val viewId = node.viewIdResourceName.orEmpty()
+            val score = maxOf(scoreLabel(text), scoreLabel(description), scoreViewId(viewId)) +
+                if (isActionable(node)) 20 else 0
+            if (score > bestScore) {
+                bestScore = score
+                best = node
             }
         }
         return best?.takeIf { bestScore >= 60 }
     }
 
+    private fun findWeChatRelativeSendNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val nodes = collectNodes(root)
+        val editable = findFocusedEditable(root)
+            ?: nodes.firstOrNull {
+                it.isEditable && it.isEnabled && it.isVisibleToUser
+            }
+            ?: return null
+
+        val editBounds = Rect().also(editable::getBoundsInScreen)
+        if (editBounds.isEmpty) return null
+
+        val density = resources.displayMetrics.density
+        val maxGap = (240 * density).toInt()
+        val minWidth = (28 * density).toInt()
+        val maxWidth = (220 * density).toInt()
+        val minHeight = (26 * density).toInt()
+        val maxHeight = (110 * density).toInt()
+
+        var best: AccessibilityNodeInfo? = null
+        var bestScore = Int.MIN_VALUE
+
+        for (node in nodes) {
+            if (node === editable || !node.isVisibleToUser || !node.isEnabled || !isActionable(node)) {
+                continue
+            }
+
+            val bounds = Rect().also(node::getBoundsInScreen)
+            if (bounds.isEmpty) continue
+            if (bounds.width() !in minWidth..maxWidth || bounds.height() !in minHeight..maxHeight) {
+                continue
+            }
+
+            val gap = bounds.left - editBounds.right
+            if (gap < -(24 * density).toInt() || gap > maxGap) continue
+
+            val overlap = min(bounds.bottom, editBounds.bottom) - max(bounds.top, editBounds.top)
+            val centerDistance = abs(bounds.centerY() - editBounds.centerY())
+            val verticallyAligned = overlap > 0 || centerDistance <= (70 * density).toInt()
+            if (!verticallyAligned) continue
+
+            val text = node.text?.toString()?.trim().orEmpty()
+            val description = node.contentDescription?.toString()?.trim().orEmpty()
+            val viewId = node.viewIdResourceName.orEmpty()
+            val className = node.className?.toString().orEmpty()
+
+            var score = 500
+            score -= max(0, gap) / max(1, density.toInt())
+            score -= centerDistance / max(1, density.toInt())
+            score += maxOf(scoreLabel(text), scoreLabel(description)).coerceAtLeast(0)
+            score += scoreViewId(viewId).coerceAtLeast(0)
+            if (className.contains("Button", ignoreCase = true)) score += 100
+            if (bounds.centerX() > editBounds.centerX()) score += 80
+            if (overlap > 0) score += 80
+
+            if (score > bestScore) {
+                bestScore = score
+                best = node
+            }
+        }
+        return best
+    }
+
+    private fun collectNodes(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        val result = ArrayList<AccessibilityNodeInfo>()
+        queue.add(root)
+
+        while (queue.isNotEmpty() && result.size < MAX_NODE_COUNT) {
+            val node = queue.removeFirst()
+            result += node
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let(queue::addLast)
+            }
+        }
+        return result
+    }
+
     private fun scoreLabel(value: String): Int {
         if (value.isBlank()) return Int.MIN_VALUE / 2
         return when {
-            value == "发送" -> 120
-            value.equals("send", ignoreCase = true) -> 120
-            value == "提交" -> 100
-            value.contains("发送") -> 80
-            value.contains("send", ignoreCase = true) -> 80
-            value.contains("提交") -> 70
+            value == "发送" -> 160
+            value.equals("send", ignoreCase = true) -> 160
+            value == "提交" || value == "确认" -> 120
+            value.contains("发送") -> 100
+            value.contains("send", ignoreCase = true) -> 100
+            value.contains("提交") || value.contains("确认") -> 80
             else -> Int.MIN_VALUE / 2
         }
     }
 
-    private fun findClickableSelfOrParent(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        var current: AccessibilityNodeInfo? = node
-        repeat(5) {
-            if (current?.isClickable == true && current?.isEnabled == true) return current
-            current = current?.parent
+    private fun scoreViewId(viewId: String): Int {
+        if (viewId.isBlank()) return Int.MIN_VALUE / 2
+        return when {
+            viewId.contains("send", ignoreCase = true) -> 110
+            viewId.contains("submit", ignoreCase = true) -> 90
+            else -> Int.MIN_VALUE / 2
+        }
+    }
+
+    private fun isActionable(node: AccessibilityNodeInfo): Boolean {
+        return node.isClickable || node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_CLICK }
+    }
+
+    private fun clickNodeOrAncestor(
+        startNode: AccessibilityNodeInfo,
+        methodPrefix: String
+    ): SendResult? {
+        var node: AccessibilityNodeInfo? = startNode
+        repeat(7) {
+            val current = node ?: return@repeat
+            if (current.isEnabled && (isActionable(current) || current === startNode)) {
+                val actionTime = System.currentTimeMillis()
+                if (current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                    val label = current.text ?: current.contentDescription ?: "发送"
+                    return SendResult(true, "$methodPrefix：$label", actionTime)
+                }
+            }
+            node = current.parent
+        }
+
+        // 某些自绘控件能被定位但拒绝 ACTION_CLICK；此时自动点击节点中心。
+        val bounds = Rect().also(startNode::getBoundsInScreen)
+        if (!bounds.isEmpty) {
+            val actionTime = System.currentTimeMillis()
+            val path = Path().apply {
+                moveTo(bounds.exactCenterX(), bounds.exactCenterY())
+            }
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0L, 1L))
+                .build()
+            if (dispatchGesture(gesture, null, null)) {
+                return SendResult(true, "$methodPrefix：自动触点", actionTime)
+            }
         }
         return null
+    }
+
+    private fun buildFailureDetail(roots: List<RootEntry>): String {
+        val packages = roots.map { it.packageName.ifBlank { "未知包名" } }.distinct()
+        val weChatRoot = roots.firstOrNull { it.packageName == WECHAT_PACKAGE }
+        val weChatInputFound = weChatRoot?.let { findFocusedEditable(it.root) != null } == true
+        return when {
+            weChatRoot == null -> "未读取到微信窗口；当前窗口：${packages.joinToString()}"
+            !weChatInputFound -> "已读取微信窗口，但未读取到聚焦输入框"
+            else -> "已读取微信输入框，但未识别到可点击的发送控件"
+        }
     }
 
     private fun acquireWakeLock(timeoutMs: Long): PowerManager.WakeLock {
@@ -238,9 +458,23 @@ class AutoSendAccessibilityService : AccessibilityService() {
             .edit().putString(MainActivity.KEY_STATUS, message).apply()
     }
 
-    data class SendResult(val success: Boolean, val method: String)
+    data class SendResult(
+        val success: Boolean,
+        val method: String,
+        val actionWallMs: Long
+    )
+
+    data class RootEntry(
+        val root: AccessibilityNodeInfo,
+        val packageName: String,
+        val windowType: Int,
+        val windowId: Int
+    )
 
     companion object {
+        private const val WECHAT_PACKAGE = "com.tencent.mm"
+        private const val MAX_NODE_COUNT = 5_000
+
         @Volatile
         var instance: AutoSendAccessibilityService? = null
             private set
