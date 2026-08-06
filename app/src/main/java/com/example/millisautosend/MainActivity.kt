@@ -47,7 +47,7 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
             service.scheduleAfter(delayMs = 5_000L, leadMs = 0L, label = "5秒测试")
-            Toast.makeText(this, "已启动。请在5秒内切回目标页面并聚焦输入框", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "已启动。请在5秒内切回微信聊天页面，并保持绿色“发送”按钮可见", Toast.LENGTH_LONG).show()
         }
 
         binding.startButton.setOnClickListener {

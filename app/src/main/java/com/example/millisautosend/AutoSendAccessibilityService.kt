@@ -221,6 +221,14 @@ class AutoSendAccessibilityService : AccessibilityService() {
             if (result != null) return result
         }
 
+        // 4. 华为/微信常见情况：微信窗口可读取，但输入框和绿色“发送”均不作为
+        //    无障碍节点暴露。此时根据微信可见窗口底边与输入法窗口顶边自动计算
+        //    绿色发送按钮中心，不需要用户选择坐标。
+        for (entry in orderedRoots.filter { it.packageName == WECHAT_PACKAGE }) {
+            val result = clickWeChatSendByGeometry(entry, orderedRoots)
+            if (result != null) return result
+        }
+
         return SendResult(false, buildFailureDetail(orderedRoots), System.currentTimeMillis())
     }
 
@@ -421,14 +429,60 @@ class AutoSendAccessibilityService : AccessibilityService() {
         return null
     }
 
+    private fun clickWeChatSendByGeometry(
+        weChatEntry: RootEntry,
+        allRoots: List<RootEntry>
+    ): SendResult? {
+        val appBounds = Rect().also(weChatEntry.root::getBoundsInScreen)
+        if (appBounds.isEmpty || appBounds.width() <= 0 || appBounds.height() <= 0) return null
+
+        val density = resources.displayMetrics.density.coerceAtLeast(1f)
+
+        // 键盘弹出时，发送按钮位于输入法窗口上方。部分系统返回的微信根窗口
+        // 仍覆盖整块屏幕，因此优先使用输入法窗口的顶边作为聊天输入栏底边。
+        val keyboardTop = allRoots
+            .asSequence()
+            .filter { it.windowType == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+            .mapNotNull { entry ->
+                val bounds = Rect().also(entry.root::getBoundsInScreen)
+                bounds.top.takeIf {
+                    !bounds.isEmpty &&
+                        it > appBounds.top + (160f * density).toInt() &&
+                        it <= appBounds.bottom
+                }
+            }
+            .minOrNull()
+
+        val visibleBottom = keyboardTop ?: appBounds.bottom
+        val minUsableHeight = (180f * density).toInt()
+        if (visibleBottom - appBounds.top < minUsableHeight) return null
+
+        // 微信绿色“发送”按钮的中心通常距右边约 30dp，距输入法顶边约 30dp。
+        // 使用 dp 和窗口边界计算，适配不同分辨率，不保存固定屏幕坐标。
+        val x = (appBounds.right - 30f * density)
+            .coerceIn(appBounds.left + 1f, appBounds.right - 1f)
+        val y = (visibleBottom - 30f * density)
+            .coerceIn(appBounds.top + 1f, visibleBottom - 1f)
+
+        val path = Path().apply { moveTo(x, y) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, 35L))
+            .build()
+        val actionTime = System.currentTimeMillis()
+
+        return if (dispatchGesture(gesture, null, null)) {
+            SendResult(true, "微信绿色发送按钮（自动定位）", actionTime)
+        } else {
+            null
+        }
+    }
+
     private fun buildFailureDetail(roots: List<RootEntry>): String {
         val packages = roots.map { it.packageName.ifBlank { "未知包名" } }.distinct()
         val weChatRoot = roots.firstOrNull { it.packageName == WECHAT_PACKAGE }
-        val weChatInputFound = weChatRoot?.let { findFocusedEditable(it.root) != null } == true
         return when {
             weChatRoot == null -> "未读取到微信窗口；当前窗口：${packages.joinToString()}"
-            !weChatInputFound -> "已读取微信窗口，但未读取到聚焦输入框"
-            else -> "已读取微信输入框，但未识别到可点击的发送控件"
+            else -> "已读取微信窗口，但节点点击和自动定位手势均未能派发"
         }
     }
 
